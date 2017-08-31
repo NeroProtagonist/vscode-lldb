@@ -7,6 +7,7 @@ import collections
 import tempfile
 import lldb
 from . import expressions
+from .stepfilters import StepFilter
 from . import debugevents
 from . import disassembly
 from . import handles
@@ -45,12 +46,14 @@ class DebugSession:
         self.request_seq = 1
         self.pending_requests = {} # { seq : on_complete }
         self.extension_poll = None
+        self.stepfilter = StepFilter()
 
     def DEBUG_initialize(self, args):
         self.line_offset = 0 if args.get('linesStartAt1', True) else 1
         self.col_offset = 0 if args.get('columnsStartAt1', True) else 1
 
         self.debugger = lldb.debugger if lldb.debugger else lldb.SBDebugger.Create()
+        self.interp = self.debugger.GetCommandInterpreter();
         log.info('LLDB version: %s', self.debugger.GetVersionString())
         self.debugger.SetAsync(True)
 
@@ -211,15 +214,15 @@ class DebugSession:
         target.GetBroadcaster().AddListener(self.event_listener, lldb.SBTarget.eBroadcastBitBreakpointChanged)
         return target
 
-    def pre_launch(self):
+    def pre_launch(self, args):
         expressions.init_formatters(self.debugger)
+        self.stepfilter.set_filters(args.get('stepFilters'))
 
     def exec_commands(self, commands):
         if commands is not None:
-            interp = self.debugger.GetCommandInterpreter()
             result = lldb.SBCommandReturnObject()
             for command in commands:
-                interp.HandleCommand(str(command), result)
+                self.interp.HandleCommand(str(command), result)
                 sys.stdout.flush()
                 output = result.GetOutput() if result.Succeeded() else result.GetError()
                 self.console_msg(output)
@@ -453,7 +456,7 @@ class DebugSession:
 
     def DEBUG_configurationDone(self, args):
         try:
-            self.pre_launch()
+            self.pre_launch(self.launch_args)
             result = self.do_launch(self.launch_args)
             # do_launch is asynchronous so we need to send its result
             self.send_response(self.launch_args['response'], result)
@@ -488,9 +491,17 @@ class DebugSession:
         tid = args['threadId']
         thread = self.process.GetThreadByID(tid)
         if not self.in_disassembly(thread.GetFrameAtIndex(0)):
-            thread.StepInto()
+            filters = self.stepfilter.getFilters();
+            if filters is not None:
+                result = lldb.SBCommandReturnObject()
+                self.interp.HandleCommand(str('thread step-in -r ' + filters), result)
+                if not result.Succeeded():
+                    raise Exception('thread step-in failed with error' + result.GetError())
+            else:
+                thread.StepInto();
         else:
             thread.StepInstruction(False)
+
 
     def DEBUG_stepOut(self, args):
         self.before_resume()
@@ -617,11 +628,10 @@ class DebugSession:
         return { 'variables': variables }
 
     def DEBUG_completions(self, args):
-        interp = self.debugger.GetCommandInterpreter()
         text = str(args['text'])
         column = int(args['column'])
         matches = lldb.SBStringList()
-        result = interp.HandleCompletion(text, column-1, 0, -1, matches)
+        result = self.interp.HandleCompletion(text, column-1, 0, -1, matches)
         targets = []
         for match in matches:
             targets.append({ 'label': match })
@@ -650,10 +660,9 @@ class DebugSession:
         if frame is not None:
             self.set_selected_frame(frame)
         # evaluate
-        interp = self.debugger.GetCommandInterpreter()
         result = lldb.SBCommandReturnObject()
         if '\n' not in command:
-            interp.HandleCommand(str(command), result)
+            self.interp.HandleCommand(str(command), result)
         else:
             # multiline command
             tmp_file = tempfile.NamedTemporaryFile()
@@ -665,7 +674,7 @@ class DebugSession:
             filespec.SetFilename(os.path.basename(tmp_file.name))
             context = lldb.SBExecutionContext(frame)
             options = lldb.SBCommandInterpreterRunOptions()
-            interp.HandleCommandsFromFile(filespec, context, options, result)
+            self.interp.HandleCommandsFromFile(filespec, context, options, result)
         sys.stdout.flush()
         return result
 
